@@ -28,39 +28,6 @@ FlashStorage(wifi_storage, WiFiConfig);
 unsigned long pressStart = 0;
 bool isPressed = false;
 
-void handleButtonEvent()
-{
-  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
-
-  if (pressed && !isPressed)
-  {
-    pressStart = millis();
-    isPressed = true;
-  }
-  else if (!pressed && isPressed)
-  {
-    unsigned long duration = millis() - pressStart;
-    isPressed = false;
-
-    if (duration > 2000)
-    {
-      Serial.println("🧹 Long press detected, resetting config...");
-
-      // 清空配置并重启
-      WiFiConfig emptyConfig = {};
-      wifi_storage.write(emptyConfig);
-      delay(1000);
-      NVIC_SystemReset(); // 软件重启
-    }
-    else
-    {
-      Serial.println("✅ Short press detected");
-      // 你可以在这里加上：手动执行一次 postActivity()
-      // 或者 print 当前连接状态等
-    }
-  }
-}
-
 WiFiUDP udp;
 const char *ntpServer = "pool.ntp.org";
 const int timeZoneOffset = 0; // UTC
@@ -142,6 +109,8 @@ void setup()
   while (!Serial)
     ;
 
+  initIMU();
+
   if (tryConnectFromFlash())
   {
     return; // 成功连接就不启动 AP
@@ -167,7 +136,9 @@ void loop()
   handleHttpRequest();
   handleWiFiConnection();
   // handlePeriodicPost();
-  handleButtonEvent();
+
+  collectFeatures();
+  delay(500); 
 }
 
 void saveWiFiConfig(String ssid, String pass, String catId)
@@ -192,7 +163,7 @@ String getDeviceId()
   byte mac[6];
   WiFi.macAddress(mac);
   char macStr[18];
-  sprintf(macStr, "%02X%02X%02X%02X%02X%02X",
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(macStr);
 }
@@ -395,44 +366,6 @@ String urlDecode(String input)
   return decoded;
 }
 
-void initIMU()
-{
-  if (!IMU.begin())
-  {
-    Serial.println("❌ 无法初始化加速度计（IMU）！");
-    while (true)
-      ; // 卡住
-  }
-
-  Serial.println("✅ 加速度计初始化成功！");
-}
-
-void getAcceleration()
-{
-  float x, y, z;
-
-  if (IMU.accelerationAvailable())
-  {
-    IMU.readAcceleration(x, y, z);
-
-    float threshold = 0.2; // 灵敏度阈值
-    if (abs(x) > threshold || abs(y) > threshold || abs(z - 1.0) > threshold)
-    {
-      Serial.println("🐾 Cat is moving");
-    }
-    else
-    {
-      Serial.println("😴 Cat is resting");
-    }
-  }
-  else
-  {
-    Serial.println("等待数据...");
-  }
-
-  delay(300);
-}
-
 void postActivity(const char *catId, const char *status, const char *timestamp)
 {
   WiFiSSLClient client;
@@ -547,4 +480,176 @@ void addDeviceToServer()
   {
     Serial.println("❌ Failed to connect to backend");
   }
+}
+
+
+void initIMU()
+{
+  if (!IMU.begin())
+  {
+    Serial.println("❌ 无法初始化加速度计（IMU）！");
+    while (true)
+      ; // 卡住
+  }
+
+  Serial.println("✅ 加速度计初始化成功！");
+}
+
+const int SAMPLE_RATE = 30;       
+const int SAMPLE_INTERVAL = 1000 / SAMPLE_RATE;
+
+float xSamples[SAMPLE_RATE];
+float ySamples[SAMPLE_RATE];
+float zSamples[SAMPLE_RATE];
+
+void collectFeatures() {
+  // 1. 收集 1 秒 30 个点
+  for (int i = 0; i < SAMPLE_RATE; i++) {
+    while (!IMU.accelerationAvailable());
+    IMU.readAcceleration(xSamples[i], ySamples[i], zSamples[i]);
+    delay(SAMPLE_INTERVAL);
+  }
+
+  // --- X 轴 ---
+  float xMean = mean(xSamples, SAMPLE_RATE);
+  float xSd = stddev(xSamples, SAMPLE_RATE, xMean);
+  float xMin = minValue(xSamples, SAMPLE_RATE);
+  float xMax = maxValue(xSamples, SAMPLE_RATE);
+  float xSum = sum(xSamples, SAMPLE_RATE);
+  float xSkew = skewness(xSamples, SAMPLE_RATE, xMean, xSd);
+  float xKurt = kurtosis(xSamples, SAMPLE_RATE, xMean, xSd);
+
+  // --- Y 轴 ---
+  float yMean = mean(ySamples, SAMPLE_RATE);
+  float ySd = stddev(ySamples, SAMPLE_RATE, yMean);
+  float yMin = minValue(ySamples, SAMPLE_RATE);
+  float yMax = maxValue(ySamples, SAMPLE_RATE);
+  float ySum = sum(ySamples, SAMPLE_RATE);
+  float ySkew = skewness(ySamples, SAMPLE_RATE, yMean, ySd);
+  float yKurt = kurtosis(ySamples, SAMPLE_RATE, yMean, ySd);
+
+  // --- Z 轴 ---
+  float zMean = mean(zSamples, SAMPLE_RATE);
+  float zSd = stddev(zSamples, SAMPLE_RATE, zMean);
+  float zMin = minValue(zSamples, SAMPLE_RATE);
+  float zMax = maxValue(zSamples, SAMPLE_RATE);
+  float zSum = sum(zSamples, SAMPLE_RATE);
+  float zSkew = skewness(zSamples, SAMPLE_RATE, zMean, zSd);
+  float zKurt = kurtosis(zSamples, SAMPLE_RATE, zMean, zSd);
+
+  // --- VM ---
+  float vmArray[SAMPLE_RATE];
+  for (int i = 0; i < SAMPLE_RATE; i++) {
+    vmArray[i] = sqrt(xSamples[i] * xSamples[i] +
+                      ySamples[i] * ySamples[i] +
+                      zSamples[i] * zSamples[i]);
+  }
+  float vmMean = mean(vmArray, SAMPLE_RATE);
+  float vmSd = stddev(vmArray, SAMPLE_RATE, vmMean);
+  float vmMin = minValue(vmArray, SAMPLE_RATE);
+  float vmMax = maxValue(vmArray, SAMPLE_RATE);
+  float vmSum = sum(vmArray, SAMPLE_RATE);
+  float vmSkew = skewness(vmArray, SAMPLE_RATE, vmMean, vmSd);
+  float vmKurt = kurtosis(vmArray, SAMPLE_RATE, vmMean, vmSd);
+
+  // --- 相关系数 ---
+  float corXY = correlation(xSamples, ySamples, SAMPLE_RATE, xMean, yMean);
+  float corXZ = correlation(xSamples, zSamples, SAMPLE_RATE, xMean, zMean);
+  float corYZ = correlation(ySamples, zSamples, SAMPLE_RATE, yMean, zMean);
+
+  // 2. 直接打印一行
+  Serial.print(xMean); Serial.print(",");
+  Serial.print(xMin); Serial.print(",");
+  Serial.print(xMax); Serial.print(",");
+  Serial.print(xSum); Serial.print(",");
+  Serial.print(xSd); Serial.print(",");
+  Serial.print(xSkew); Serial.print(",");
+  Serial.print(xKurt); Serial.print(",");
+
+  Serial.print(yMean); Serial.print(",");
+  Serial.print(yMin); Serial.print(",");
+  Serial.print(yMax); Serial.print(",");
+  Serial.print(ySum); Serial.print(",");
+  Serial.print(ySd); Serial.print(",");
+  Serial.print(ySkew); Serial.print(",");
+  Serial.print(yKurt); Serial.print(",");
+
+  Serial.print(zMean); Serial.print(",");
+  Serial.print(zMin); Serial.print(",");
+  Serial.print(zMax); Serial.print(",");
+  Serial.print(zSum); Serial.print(",");
+  Serial.print(zSd); Serial.print(",");
+  Serial.print(zSkew); Serial.print(",");
+  Serial.print(zKurt); Serial.print(",");
+
+  Serial.print(vmMean); Serial.print(",");
+  Serial.print(vmMin); Serial.print(",");
+  Serial.print(vmMax); Serial.print(",");
+  Serial.print(vmSum); Serial.print(",");
+  Serial.print(vmSd); Serial.print(",");
+  Serial.print(vmSkew); Serial.print(",");
+  Serial.print(vmKurt); Serial.print(",");
+
+  Serial.print(corXY); Serial.print(",");
+  Serial.print(corXZ); Serial.print(",");
+  Serial.println(corYZ);
+}
+
+/** ======= 工具函数 ======= */
+
+float sum(float *data, int n) {
+  float s = 0;
+  for (int i = 0; i < n; i++) s += data[i];
+  return s;
+}
+
+float mean(float *data, int n) {
+  return sum(data, n) / n;
+}
+
+float minValue(float *data, int n) {
+  float m = data[0];
+  for (int i = 1; i < n; i++) if (data[i] < m) m = data[i];
+  return m;
+}
+
+float maxValue(float *data, int n) {
+  float m = data[0];
+  for (int i = 1; i < n; i++) if (data[i] > m) m = data[i];
+  return m;
+}
+
+float stddev(float *data, int n, float meanVal) {
+  float s = 0;
+  for (int i = 0; i < n; i++) {
+    float diff = data[i] - meanVal;
+    s += diff * diff;
+  }
+  return sqrt(s / n);
+}
+
+float skewness(float *data, int n, float meanVal, float sdVal) {
+  float s = 0;
+  for (int i = 0; i < n; i++) {
+    s += pow((data[i] - meanVal) / sdVal, 3);
+  }
+  return s / n;
+}
+
+float kurtosis(float *data, int n, float meanVal, float sdVal) {
+  float s = 0;
+  for (int i = 0; i < n; i++) {
+    s += pow((data[i] - meanVal) / sdVal, 4);
+  }
+  return s / n - 3; // Fisher定义 (减3)
+}
+
+float correlation(float *a, float *b, int n, float meanA, float meanB) {
+  float num = 0, denA = 0, denB = 0;
+  for (int i = 0; i < n; i++) {
+    num += (a[i] - meanA) * (b[i] - meanB);
+    denA += pow(a[i] - meanA, 2);
+    denB += pow(b[i] - meanB, 2);
+  }
+  return num / sqrt(denA * denB);
 }
