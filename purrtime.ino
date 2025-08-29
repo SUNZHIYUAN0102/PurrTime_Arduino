@@ -3,6 +3,48 @@
 #include <FlashStorage.h>
 #include <WiFiUdp.h>
 #include <TimeLib.h>
+#include <ArduinoBLE.h>
+
+#define ENABLE_BLE_STREAM 1
+#define BLE_SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
+#define BLE_CHAR_TX_UUID "12345678-1234-5678-1234-56789abcdef1" // notify
+
+BLEService dataService(BLE_SERVICE_UUID);
+BLECharacteristic txChar(BLE_CHAR_TX_UUID, BLERead | BLENotify, 512);
+
+bool initBLE()
+{
+  if (!BLE.begin())
+  {
+    Serial.println("❌ BLE init failed");
+    return false;
+  }
+  BLE.setLocalName("Nano33IoT");
+  BLE.setDeviceName("Nano33IoT");
+  BLE.setAdvertisedService(dataService);
+  dataService.addCharacteristic(txChar);
+  BLE.addService(dataService);
+
+  uint8_t zero = 0;
+  txChar.writeValue(&zero, 1);
+
+  BLE.advertise();
+  Serial.println("📡 BLE advertising...");
+  return true;
+}
+
+void bleSendLongLine(const char *line)
+{
+  const size_t MTU_SAFE = 180; // 保守安全片长（适配 Win 常见上限）
+  size_t n = strlen(line);
+  for (size_t i = 0; i < n; i += MTU_SAFE)
+  {
+    size_t chunkLen = (i + MTU_SAFE <= n) ? MTU_SAFE : (n - i);
+    txChar.writeValue((const uint8_t *)(line + i), chunkLen);
+    delay(5); // 给栈留点时间，防止黏包/拥塞
+  }
+}
+
 char ap_ssid[] = "Cat_Device_AP";
 char ap_pass[] = "12345678";
 WiFiServer server(80);
@@ -22,8 +64,6 @@ typedef struct
 } WiFiConfig;
 
 FlashStorage(wifi_storage, WiFiConfig);
-
-#define BUTTON_PIN 7
 
 unsigned long pressStart = 0;
 bool isPressed = false;
@@ -73,36 +113,6 @@ void syncTimeWithNTP()
   }
 }
 
-void handlePeriodicPost()
-{
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  unsigned long now = millis();
-
-  // 同步 NTP 时间（每小时）
-  if (now - lastNtpSync > ntpSyncInterval || currentUtcTime == 0)
-  {
-    syncTimeWithNTP();
-    lastNtpSync = now;
-  }
-
-  // 每分钟发送一次
-  if (now - lastPostTime >= postInterval)
-  {
-    lastPostTime = now;
-
-    char timestampBuffer[30];
-    sprintf(timestampBuffer, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-            year(), month(), day(), hour(), minute(), second());
-
-    postActivity(
-        "4d8bc5ed-1b60-4181-89ae-becdf0cddedf", // catId
-        "Resting",
-        timestampBuffer);
-  }
-}
-
 void setup()
 {
   Serial.begin(115200);
@@ -111,34 +121,54 @@ void setup()
 
   initIMU();
 
-  if (tryConnectFromFlash())
-  {
-    return; // 成功连接就不启动 AP
-  }
-
-  // 启动热点模式
-  if (WiFi.beginAP(ap_ssid, ap_pass) != WL_AP_LISTENING)
-  {
-    Serial.println("Failed to start AP");
-    while (true)
+  if (!initBLE())
+    while (1)
       ;
-  }
 
-  Serial.print("AP started. Connect to: ");
-  Serial.println(WiFi.localIP());
+  // if (tryConnectFromFlash())
+  // {
+  //   return; // 成功连接就不启动 AP
+  // }
 
-  server.begin();
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // // 启动热点模式
+  // if (WiFi.beginAP(ap_ssid, ap_pass) != WL_AP_LISTENING)
+  // {
+  //   Serial.println("Failed to start AP");
+  //   while (true)
+  //     ;
+  // }
+
+  // Serial.print("AP started. Connect to: ");
+  // Serial.println(WiFi.localIP());
+
+  // server.begin();
 }
 
 void loop()
 {
   handleHttpRequest();
   handleWiFiConnection();
-  // handlePeriodicPost();
+  // collectFeatures();
+  // delay(500);
 
-  collectFeatures();
-  delay(500); 
+  BLEDevice central = BLE.central();
+  if (central)
+  {
+    Serial.print("🔗 BLE connected: ");
+    Serial.println(central.address());
+
+    unsigned long last = 0;
+    while (central.connected())
+    {
+      BLE.poll();
+      if (millis() - last >= 1000)
+      { // 每秒一次
+        last = millis();
+        collectFeatures(); // ← 这行会计算+打印+BLE发送
+      }
+    }
+    Serial.println("🔌 BLE disconnected");
+  }
 }
 
 void saveWiFiConfig(String ssid, String pass, String catId)
@@ -292,7 +322,7 @@ void handleWiFiConnection()
     Serial.println(WiFi.localIP());
 
     saveWiFiConfig(targetSSID, targetPASS, targetCatId);
-    syncTimeWithNTP(); // 同步 NTP 时间
+    syncTimeWithNTP();   // 同步 NTP 时间
     addDeviceToServer(); // 注册设备到服务器
   }
   else
@@ -482,7 +512,6 @@ void addDeviceToServer()
   }
 }
 
-
 void initIMU()
 {
   if (!IMU.begin())
@@ -495,17 +524,20 @@ void initIMU()
   Serial.println("✅ 加速度计初始化成功！");
 }
 
-const int SAMPLE_RATE = 30;       
+const int SAMPLE_RATE = 30;
 const int SAMPLE_INTERVAL = 1000 / SAMPLE_RATE;
 
 float xSamples[SAMPLE_RATE];
 float ySamples[SAMPLE_RATE];
 float zSamples[SAMPLE_RATE];
 
-void collectFeatures() {
+void collectFeatures()
+{
   // 1. 收集 1 秒 30 个点
-  for (int i = 0; i < SAMPLE_RATE; i++) {
-    while (!IMU.accelerationAvailable());
+  for (int i = 0; i < SAMPLE_RATE; i++)
+  {
+    while (!IMU.accelerationAvailable())
+      ;
     IMU.readAcceleration(xSamples[i], ySamples[i], zSamples[i]);
     delay(SAMPLE_INTERVAL);
   }
@@ -539,7 +571,8 @@ void collectFeatures() {
 
   // --- VM ---
   float vmArray[SAMPLE_RATE];
-  for (int i = 0; i < SAMPLE_RATE; i++) {
+  for (int i = 0; i < SAMPLE_RATE; i++)
+  {
     vmArray[i] = sqrt(xSamples[i] * xSamples[i] +
                       ySamples[i] * ySamples[i] +
                       zSamples[i] * zSamples[i]);
@@ -558,95 +591,99 @@ void collectFeatures() {
   float corYZ = correlation(ySamples, zSamples, SAMPLE_RATE, yMean, zMean);
 
   // 2. 直接打印一行
-  Serial.print(xMean); Serial.print(",");
-  Serial.print(xMin); Serial.print(",");
-  Serial.print(xMax); Serial.print(",");
-  Serial.print(xSum); Serial.print(",");
-  Serial.print(xSd); Serial.print(",");
-  Serial.print(xSkew); Serial.print(",");
-  Serial.print(xKurt); Serial.print(",");
+  static char line[512];
+  int len = snprintf(line, sizeof(line),
+                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // X: mean,min,max,sum,sd,skew,kurt
+                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // Y
+                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // Z
+                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // VM
+                     "%.6f,%.6f,%.6f\n",                   // Corr: XY,XZ,YZ
+                     xMean, xMin, xMax, xSum, xSd, xSkew, xKurt,
+                     yMean, yMin, yMax, ySum, ySd, ySkew, yKurt,
+                     zMean, zMin, zMax, zSum, zSd, zSkew, zKurt,
+                     vmMean, vmMin, vmMax, vmSum, vmSd, vmSkew, vmKurt,
+                     corXY, corXZ, corYZ);
 
-  Serial.print(yMean); Serial.print(",");
-  Serial.print(yMin); Serial.print(",");
-  Serial.print(yMax); Serial.print(",");
-  Serial.print(ySum); Serial.print(",");
-  Serial.print(ySd); Serial.print(",");
-  Serial.print(ySkew); Serial.print(",");
-  Serial.print(yKurt); Serial.print(",");
+  // 串口打印（保持你原有行为）
+  Serial.print(line);
 
-  Serial.print(zMean); Serial.print(",");
-  Serial.print(zMin); Serial.print(",");
-  Serial.print(zMax); Serial.print(",");
-  Serial.print(zSum); Serial.print(",");
-  Serial.print(zSd); Serial.print(",");
-  Serial.print(zSkew); Serial.print(",");
-  Serial.print(zKurt); Serial.print(",");
-
-  Serial.print(vmMean); Serial.print(",");
-  Serial.print(vmMin); Serial.print(",");
-  Serial.print(vmMax); Serial.print(",");
-  Serial.print(vmSum); Serial.print(",");
-  Serial.print(vmSd); Serial.print(",");
-  Serial.print(vmSkew); Serial.print(",");
-  Serial.print(vmKurt); Serial.print(",");
-
-  Serial.print(corXY); Serial.print(",");
-  Serial.print(corXZ); Serial.print(",");
-  Serial.println(corYZ);
+  // 通过 BLE 通知发出去（中心设备需先订阅）
+  // 注意：BLE 与 WiFiNINA 无法同时工作；此版本用于 BLE 模式。
+  if (len > 0)
+  {
+    bleSendLongLine(line);
+  }
 }
 
 /** ======= 工具函数 ======= */
 
-float sum(float *data, int n) {
+float sum(float *data, int n)
+{
   float s = 0;
-  for (int i = 0; i < n; i++) s += data[i];
+  for (int i = 0; i < n; i++)
+    s += data[i];
   return s;
 }
 
-float mean(float *data, int n) {
+float mean(float *data, int n)
+{
   return sum(data, n) / n;
 }
 
-float minValue(float *data, int n) {
+float minValue(float *data, int n)
+{
   float m = data[0];
-  for (int i = 1; i < n; i++) if (data[i] < m) m = data[i];
+  for (int i = 1; i < n; i++)
+    if (data[i] < m)
+      m = data[i];
   return m;
 }
 
-float maxValue(float *data, int n) {
+float maxValue(float *data, int n)
+{
   float m = data[0];
-  for (int i = 1; i < n; i++) if (data[i] > m) m = data[i];
+  for (int i = 1; i < n; i++)
+    if (data[i] > m)
+      m = data[i];
   return m;
 }
 
-float stddev(float *data, int n, float meanVal) {
+float stddev(float *data, int n, float meanVal)
+{
   float s = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     float diff = data[i] - meanVal;
     s += diff * diff;
   }
   return sqrt(s / n);
 }
 
-float skewness(float *data, int n, float meanVal, float sdVal) {
+float skewness(float *data, int n, float meanVal, float sdVal)
+{
   float s = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     s += pow((data[i] - meanVal) / sdVal, 3);
   }
   return s / n;
 }
 
-float kurtosis(float *data, int n, float meanVal, float sdVal) {
+float kurtosis(float *data, int n, float meanVal, float sdVal)
+{
   float s = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     s += pow((data[i] - meanVal) / sdVal, 4);
   }
   return s / n - 3; // Fisher定义 (减3)
 }
 
-float correlation(float *a, float *b, int n, float meanA, float meanB) {
+float correlation(float *a, float *b, int n, float meanA, float meanB)
+{
   float num = 0, denA = 0, denB = 0;
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++)
+  {
     num += (a[i] - meanA) * (b[i] - meanB);
     denA += pow(a[i] - meanA, 2);
     denB += pow(b[i] - meanB, 2);
