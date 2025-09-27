@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <TimeLib.h>
 #include <ArduinoBLE.h>
+#include <Wire.h>
 
 #define ENABLE_BLE_STREAM 1
 #define BLE_SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
@@ -45,9 +46,39 @@ void bleSendLongLine(const char *line)
   }
 }
 
+void setAccelRange8g()
+{
+  // 先读 CTRL1_XL
+  Wire.beginTransmission(0x6A); // LSM6DS3 I2C 地址（默认 0x6A）
+  Wire.write(0x10);             // CTRL1_XL
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x6A, 1);
+  uint8_t ctrl1 = Wire.read();
+
+  // 清掉 FS bits (bit[3:2])，写成 10 (8g)
+  ctrl1 &= ~(0b11 << 2);
+  ctrl1 |= (0b10 << 2);
+
+  // 写回去
+  Wire.beginTransmission(0x6A);
+  Wire.write(0x10);
+  Wire.write(ctrl1);
+  Wire.endTransmission();
+}
+
 char ap_ssid[] = "Cat_Device_AP";
 char ap_pass[] = "12345678";
 WiFiServer server(80);
+
+enum NetMode
+{
+  MODE_AP,
+  MODE_STA
+};
+NetMode netMode = MODE_AP;
+
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000;
 
 bool shouldConnect = false;
 String targetSSID = "";
@@ -64,9 +95,6 @@ typedef struct
 } WiFiConfig;
 
 FlashStorage(wifi_storage, WiFiConfig);
-
-unsigned long pressStart = 0;
-bool isPressed = false;
 
 WiFiUDP udp;
 const char *ntpServer = "pool.ntp.org";
@@ -116,58 +144,117 @@ void syncTimeWithNTP()
 void setup()
 {
   Serial.begin(115200);
-  while (!Serial)
-    ;
+  // while (!Serial)
+  //   ;
 
   initIMU();
 
-  if (!initBLE())
-    while (1)
-      ;
+  setAccelRange8g();
+  Serial.println("Accel range set to ±8g");
 
-  // if (tryConnectFromFlash())
-  // {
-  //   return; // 成功连接就不启动 AP
-  // }
+  // 蓝牙模式
+  if (ENABLE_BLE_STREAM == 1)
+  {
+    if (!initBLE())
+      while (1)
+        ;
+  }
+  // WiFi模式
+  else
+  {
+    if (tryConnectFromFlash())
+    {
+      return; // 成功连接就不启动 AP
+    }
 
-  // // 启动热点模式
-  // if (WiFi.beginAP(ap_ssid, ap_pass) != WL_AP_LISTENING)
-  // {
-  //   Serial.println("Failed to start AP");
-  //   while (true)
-  //     ;
-  // }
+    // 启动热点模式
+    if (WiFi.beginAP(ap_ssid, ap_pass) != WL_AP_LISTENING)
+    {
+      Serial.println("Failed to start AP");
+      while (true)
+        ;
+    }
 
-  // Serial.print("AP started. Connect to: ");
-  // Serial.println(WiFi.localIP());
+    Serial.print("AP started. Connect to: ");
+    Serial.println(WiFi.localIP());
 
-  // server.begin();
+    server.begin();
+  }
 }
 
 void loop()
 {
   handleHttpRequest();
   handleWiFiConnection();
-  // collectFeatures();
-  // delay(500);
 
-  BLEDevice central = BLE.central();
-  if (central)
+  if (ENABLE_BLE_STREAM == 1)
   {
-    Serial.print("🔗 BLE connected: ");
-    Serial.println(central.address());
-
-    unsigned long last = 0;
-    while (central.connected())
+    BLEDevice central = BLE.central();
+    if (central)
     {
-      BLE.poll();
-      if (millis() - last >= 1000)
-      { // 每秒一次
-        last = millis();
-        collectFeatures(); // ← 这行会计算+打印+BLE发送
+      Serial.print("🔗 BLE connected: ");
+      Serial.println(central.address());
+
+      unsigned long last = 0;
+      while (central.connected())
+      {
+        BLE.poll();
+        // if (millis() - last >= 1000)
+        // { // 每秒一次
+        //   last = millis();
+        //   collectFeatures(); // ← 这行会计算+打印+BLE发送
+        // }
+        collectFeatures();
+      }
+      Serial.println("🔌 BLE disconnected");
+    }
+  }
+  else
+  {
+    WiFiConfig config = wifi_storage.read();
+    if (config.catId && config.registered && WiFi.status() == WL_CONNECTED)
+    {
+      collectFeatures();
+    }
+
+    if (millis() - lastWiFiCheck >= WIFI_CHECK_INTERVAL)
+    {
+      lastWiFiCheck = millis();
+
+      if (WiFi.status() != WL_CONNECTED)
+      {
+        // 不在线 ⇒ 若当前不是 AP，则切回 AP（避免重复 beginAP）
+        if (netMode != MODE_AP)
+        {
+          Serial.println("⚠️ WiFi disconnected → switch to AP");
+
+          WiFi.end();
+          delay(1000);
+
+          if (WiFi.beginAP(ap_ssid, ap_pass) != WL_AP_LISTENING)
+          {
+            Serial.println("Failed to start AP");
+            while (true)
+              ;
+          }
+
+          Serial.print("AP started. Connect to: ");
+          Serial.println(WiFi.localIP());
+
+          netMode = MODE_AP;
+          server.begin();
+        }
+      }
+      else
+      {
+        // 已在线 ⇒ 标记为 STA（避免 AP/STA 反复切换）
+        if (netMode != MODE_STA)
+        {
+          netMode = MODE_STA;
+          Serial.println("✅ WiFi back online (STA)");
+        }
       }
     }
-    Serial.println("🔌 BLE disconnected");
   }
 }
 
@@ -221,6 +308,8 @@ bool tryConnectFromFlash()
     Serial.println("\n✅ Auto-reconnected!");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    syncTimeWithNTP(); // 同步 NTP 时间
+    netMode = MODE_STA;
     return true;
   }
   else
@@ -321,6 +410,8 @@ void handleWiFiConnection()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
+    netMode = MODE_STA;
+
     saveWiFiConfig(targetSSID, targetPASS, targetCatId);
     syncTimeWithNTP();   // 同步 NTP 时间
     addDeviceToServer(); // 注册设备到服务器
@@ -336,6 +427,7 @@ void handleWiFiConnection()
     {
       Serial.println("📡 AP restarted at: ");
       Serial.println(WiFi.localIP());
+      netMode = MODE_AP;
 
       server.begin(); // ✅ 重新启动 HTTP server
     }
@@ -394,50 +486,6 @@ String urlDecode(String input)
     i++;
   }
   return decoded;
-}
-
-void postActivity(const char *catId, const char *status, const char *timestamp)
-{
-  WiFiSSLClient client;
-  const char *host = "purrtimebackend.onrender.com";
-  int port = 443;
-
-  String url = "/activities/" + String(catId);
-
-  // 构造 JSON 请求体
-  String jsonBody = "{\"status\":\"" + String(status) + "\",\"timeStamp\":\"" + String(timestamp) + "\"}";
-
-  // 尝试连接服务器
-  if (client.connect(host, port))
-  {
-    Serial.println("✅ Connected to server");
-
-    client.println("POST " + url + " HTTP/1.1");
-    client.println("Host: " + String(host));
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(jsonBody.length());
-    client.println("Connection: close");
-    client.println();         // 结束 Header
-    client.println(jsonBody); // 发送正文
-
-    // 可选：读取响应
-    while (client.connected())
-    {
-      if (client.available())
-      {
-        String line = client.readStringUntil('\n');
-        Serial.println(line);
-      }
-    }
-
-    client.stop();
-    Serial.println("✅ Request sent and connection closed");
-  }
-  else
-  {
-    Serial.println("❌ Connection to server failed");
-  }
 }
 
 void addDeviceToServer()
@@ -542,67 +590,70 @@ void collectFeatures()
     delay(SAMPLE_INTERVAL);
   }
 
+  // Z轴取反, X轴取反
+  for (int i = 0; i < SAMPLE_RATE; i++)
+  {
+    zSamples[i] = -zSamples[i];
+    xSamples[i] = -xSamples[i];
+  }
+
   // --- X 轴 ---
   float xMean = mean(xSamples, SAMPLE_RATE);
-  float xSd = stddev(xSamples, SAMPLE_RATE, xMean);
+  // float xSd = stddev(xSamples, SAMPLE_RATE, xMean);
   float xMin = minValue(xSamples, SAMPLE_RATE);
   float xMax = maxValue(xSamples, SAMPLE_RATE);
   float xSum = sum(xSamples, SAMPLE_RATE);
-  float xSkew = skewness(xSamples, SAMPLE_RATE, xMean, xSd);
-  float xKurt = kurtosis(xSamples, SAMPLE_RATE, xMean, xSd);
+  // float xSkew = skewness(xSamples, SAMPLE_RATE, xMean, xSd);
+  // float xKurt = kurtosis(xSamples, SAMPLE_RATE, xMean, xSd);
 
   // --- Y 轴 ---
   float yMean = mean(ySamples, SAMPLE_RATE);
-  float ySd = stddev(ySamples, SAMPLE_RATE, yMean);
+  // float ySd = stddev(ySamples, SAMPLE_RATE, yMean);
   float yMin = minValue(ySamples, SAMPLE_RATE);
   float yMax = maxValue(ySamples, SAMPLE_RATE);
   float ySum = sum(ySamples, SAMPLE_RATE);
-  float ySkew = skewness(ySamples, SAMPLE_RATE, yMean, ySd);
-  float yKurt = kurtosis(ySamples, SAMPLE_RATE, yMean, ySd);
+  // float ySkew = skewness(ySamples, SAMPLE_RATE, yMean, ySd);
+  // float yKurt = kurtosis(ySamples, SAMPLE_RATE, yMean, ySd);
 
   // --- Z 轴 ---
   float zMean = mean(zSamples, SAMPLE_RATE);
-  float zSd = stddev(zSamples, SAMPLE_RATE, zMean);
+  // float zSd = stddev(zSamples, SAMPLE_RATE, zMean);
   float zMin = minValue(zSamples, SAMPLE_RATE);
   float zMax = maxValue(zSamples, SAMPLE_RATE);
   float zSum = sum(zSamples, SAMPLE_RATE);
-  float zSkew = skewness(zSamples, SAMPLE_RATE, zMean, zSd);
-  float zKurt = kurtosis(zSamples, SAMPLE_RATE, zMean, zSd);
+  // float zSkew = skewness(zSamples, SAMPLE_RATE, zMean, zSd);
+  // float zKurt = kurtosis(zSamples, SAMPLE_RATE, zMean, zSd);
 
   // --- VM ---
-  float vmArray[SAMPLE_RATE];
-  for (int i = 0; i < SAMPLE_RATE; i++)
-  {
-    vmArray[i] = sqrt(xSamples[i] * xSamples[i] +
-                      ySamples[i] * ySamples[i] +
-                      zSamples[i] * zSamples[i]);
-  }
-  float vmMean = mean(vmArray, SAMPLE_RATE);
-  float vmSd = stddev(vmArray, SAMPLE_RATE, vmMean);
-  float vmMin = minValue(vmArray, SAMPLE_RATE);
-  float vmMax = maxValue(vmArray, SAMPLE_RATE);
-  float vmSum = sum(vmArray, SAMPLE_RATE);
-  float vmSkew = skewness(vmArray, SAMPLE_RATE, vmMean, vmSd);
-  float vmKurt = kurtosis(vmArray, SAMPLE_RATE, vmMean, vmSd);
+  // float vmArray[SAMPLE_RATE];
+  // for (int i = 0; i < SAMPLE_RATE; i++)
+  // {
+  //   vmArray[i] = sqrt(xSamples[i] * xSamples[i] +
+  //                     ySamples[i] * ySamples[i] +
+  //                     zSamples[i] * zSamples[i]);
+  // }
+  // float vmMean = mean(vmArray, SAMPLE_RATE);
+  // float vmSd = stddev(vmArray, SAMPLE_RATE, vmMean);
+  // float vmMin = minValue(vmArray, SAMPLE_RATE);
+  // float vmMax = maxValue(vmArray, SAMPLE_RATE);
+  // float vmSum = sum(vmArray, SAMPLE_RATE);
+  // float vmSkew = skewness(vmArray, SAMPLE_RATE, vmMean, vmSd);
+  // float vmKurt = kurtosis(vmArray, SAMPLE_RATE, vmMean, vmSd);
 
   // --- 相关系数 ---
-  float corXY = correlation(xSamples, ySamples, SAMPLE_RATE, xMean, yMean);
-  float corXZ = correlation(xSamples, zSamples, SAMPLE_RATE, xMean, zMean);
-  float corYZ = correlation(ySamples, zSamples, SAMPLE_RATE, yMean, zMean);
+  // float corXY = correlation(xSamples, ySamples, SAMPLE_RATE, xMean, yMean);
+  // float corXZ = correlation(xSamples, zSamples, SAMPLE_RATE, xMean, zMean);
+  // float corYZ = correlation(ySamples, zSamples, SAMPLE_RATE, yMean, zMean);
 
   // 2. 直接打印一行
   static char line[512];
   int len = snprintf(line, sizeof(line),
-                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // X: mean,min,max,sum,sd,skew,kurt
-                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // Y
-                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // Z
-                     "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f," // VM
-                     "%.6f,%.6f,%.6f\n",                   // Corr: XY,XZ,YZ
-                     xMean, xMin, xMax, xSum, xSd, xSkew, xKurt,
-                     yMean, yMin, yMax, ySum, ySd, ySkew, yKurt,
-                     zMean, zMin, zMax, zSum, zSd, zSkew, zKurt,
-                     vmMean, vmMin, vmMax, vmSum, vmSd, vmSkew, vmKurt,
-                     corXY, corXZ, corYZ);
+                     "%.6f,%.6f,%.6f,%.6f,"   // X: mean,min,max,sum,sd,skew,kurt
+                     "%.6f,%.6f,%.6f,%.6f,"   // Y
+                     "%.6f,%.6f,%.6f,%.6f\n", // Z
+                     xMean, xMin, xMax, xSum,
+                     yMean, yMin, yMax, ySum,
+                     zMean, zMin, zMax, zSum);
 
   // 串口打印（保持你原有行为）
   Serial.print(line);
@@ -611,7 +662,89 @@ void collectFeatures()
   // 注意：BLE 与 WiFiNINA 无法同时工作；此版本用于 BLE 模式。
   if (len > 0)
   {
-    bleSendLongLine(line);
+    if (ENABLE_BLE_STREAM == 1)
+    {
+      bleSendLongLine(line);
+    }
+    else
+    {
+      float feats[12];
+      int k = 0;
+      feats[k++] = xMean;
+      feats[k++] = xMin;
+      feats[k++] = xMax;
+      feats[k++] = xSum;
+      feats[k++] = yMean;
+      feats[k++] = yMin;
+      feats[k++] = yMax;
+      feats[k++] = ySum;
+      feats[k++] = zMean;
+      feats[k++] = zMin;
+      feats[k++] = zMax;
+      feats[k++] = zSum;
+
+      char ts[30];
+      sprintf(ts, "%04d-%02d-%02dT%02d:%02d:%02dZ", year(), month(), day(), hour(), minute(), second());
+      postBehaviours(ts, feats, k);
+    }
+  }
+}
+
+// 接收加速计的rawData，数组类型
+void postBehaviours(const char *timestampISO, const float *feats, size_t n)
+{
+  WiFiSSLClient client;
+  const char *host = "purrtimebackend.onrender.com";
+  int port = 443;
+
+  WiFiConfig config = wifi_storage.read();
+  String catId = String(config.catId);
+
+  String url = "/behaviours/" + String(catId);
+
+  // 构造 JSON 请求体
+  String body;
+  body.reserve(1024);
+  body += "{\"timestamp\":\"";
+  body += timestampISO;
+  body += "\",\"rawData\":[";
+
+  for (size_t i = 0; i < n; ++i)
+  {
+    if (i)
+      body += ",";
+    body += String(feats[i], 6);
+  }
+  body += "]}";
+
+  // 尝试连接服务器
+  if (client.connect(host, port))
+  {
+    client.println(String("POST ") + url + " HTTP/1.1");
+    client.println(String("Host: ") + host);
+    client.println("Content-Type: application/json");
+    client.print("Content-Length: ");
+    client.println(body.length()); // ✅ 用 body.length()
+    client.println("Connection: close");
+    client.println();
+    client.print(body);
+
+    unsigned long t0 = millis();
+    while (client.connected() && millis() - t0 < 5000)
+    {
+      while (client.available())
+      {
+        String line = client.readStringUntil('\n');
+        Serial.println(line);
+        t0 = millis();
+      }
+    }
+    client.stop();
+    Serial.println("✅ POST /behaviours done");
+  }
+  else
+  {
+    Serial.println("❌ Connection failed");
   }
 }
 
