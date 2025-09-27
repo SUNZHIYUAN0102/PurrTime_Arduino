@@ -6,7 +6,7 @@
 #include <ArduinoBLE.h>
 #include <Wire.h>
 
-#define ENABLE_BLE_STREAM 1
+#define ENABLE_BLE_STREAM 0
 #define BLE_SERVICE_UUID "12345678-1234-5678-1234-56789abcdef0"
 #define BLE_CHAR_TX_UUID "12345678-1234-5678-1234-56789abcdef1" // notify
 
@@ -599,51 +599,21 @@ void collectFeatures()
 
   // --- X 轴 ---
   float xMean = mean(xSamples, SAMPLE_RATE);
-  // float xSd = stddev(xSamples, SAMPLE_RATE, xMean);
   float xMin = minValue(xSamples, SAMPLE_RATE);
   float xMax = maxValue(xSamples, SAMPLE_RATE);
   float xSum = sum(xSamples, SAMPLE_RATE);
-  // float xSkew = skewness(xSamples, SAMPLE_RATE, xMean, xSd);
-  // float xKurt = kurtosis(xSamples, SAMPLE_RATE, xMean, xSd);
 
   // --- Y 轴 ---
   float yMean = mean(ySamples, SAMPLE_RATE);
-  // float ySd = stddev(ySamples, SAMPLE_RATE, yMean);
   float yMin = minValue(ySamples, SAMPLE_RATE);
   float yMax = maxValue(ySamples, SAMPLE_RATE);
   float ySum = sum(ySamples, SAMPLE_RATE);
-  // float ySkew = skewness(ySamples, SAMPLE_RATE, yMean, ySd);
-  // float yKurt = kurtosis(ySamples, SAMPLE_RATE, yMean, ySd);
 
   // --- Z 轴 ---
   float zMean = mean(zSamples, SAMPLE_RATE);
-  // float zSd = stddev(zSamples, SAMPLE_RATE, zMean);
   float zMin = minValue(zSamples, SAMPLE_RATE);
   float zMax = maxValue(zSamples, SAMPLE_RATE);
   float zSum = sum(zSamples, SAMPLE_RATE);
-  // float zSkew = skewness(zSamples, SAMPLE_RATE, zMean, zSd);
-  // float zKurt = kurtosis(zSamples, SAMPLE_RATE, zMean, zSd);
-
-  // --- VM ---
-  // float vmArray[SAMPLE_RATE];
-  // for (int i = 0; i < SAMPLE_RATE; i++)
-  // {
-  //   vmArray[i] = sqrt(xSamples[i] * xSamples[i] +
-  //                     ySamples[i] * ySamples[i] +
-  //                     zSamples[i] * zSamples[i]);
-  // }
-  // float vmMean = mean(vmArray, SAMPLE_RATE);
-  // float vmSd = stddev(vmArray, SAMPLE_RATE, vmMean);
-  // float vmMin = minValue(vmArray, SAMPLE_RATE);
-  // float vmMax = maxValue(vmArray, SAMPLE_RATE);
-  // float vmSum = sum(vmArray, SAMPLE_RATE);
-  // float vmSkew = skewness(vmArray, SAMPLE_RATE, vmMean, vmSd);
-  // float vmKurt = kurtosis(vmArray, SAMPLE_RATE, vmMean, vmSd);
-
-  // --- 相关系数 ---
-  // float corXY = correlation(xSamples, ySamples, SAMPLE_RATE, xMean, yMean);
-  // float corXZ = correlation(xSamples, zSamples, SAMPLE_RATE, xMean, zMean);
-  // float corYZ = correlation(ySamples, zSamples, SAMPLE_RATE, yMean, zMean);
 
   // 2. 直接打印一行
   static char line[512];
@@ -690,25 +660,25 @@ void collectFeatures()
   }
 }
 
-// 接收加速计的rawData，数组类型
+const char *UDP_HOST = "100.65.24.237"; // ← 改成你电脑的 局域网IP（别用 Render 域名）
+const int UDP_PORT = 41234;            // 后端监听的端口
+
+// setup() 里加：固定本地端口，便于将来收 ACK
+// udp.begin(9000);
+
 void postBehaviours(const char *timestampISO, const float *feats, size_t n)
 {
-  WiFiSSLClient client;
-  const char *host = "purrtimebackend.onrender.com";
-  int port = 443;
+  WiFiConfig cfg = wifi_storage.read(); // 读取已保存的 catId
+  String catId = String(cfg.catId);
 
-  WiFiConfig config = wifi_storage.read();
-  String catId = String(config.catId);
-
-  String url = "/behaviours/" + String(catId);
-
-  // 构造 JSON 请求体
+  // 1) 组 JSON：带上 catId
   String body;
-  body.reserve(1024);
-  body += "{\"timestamp\":\"";
+  body.reserve(512);
+  body += "{\"catId\":\"";
+  body += catId;
+  body += "\",\"timestamp\":\"";
   body += timestampISO;
   body += "\",\"rawData\":[";
-
   for (size_t i = 0; i < n; ++i)
   {
     if (i)
@@ -717,39 +687,42 @@ void postBehaviours(const char *timestampISO, const float *feats, size_t n)
   }
   body += "]}";
 
-  // 尝试连接服务器
-  if (client.connect(host, port))
+  // 2) 解析目标 IP（也可以直接写 IPAddress dst(192,168,1,50);）
+  IPAddress dst;
+  if (WiFi.hostByName(UDP_HOST, dst) != 1)
   {
-    client.println(String("POST ") + url + " HTTP/1.1");
-    client.println(String("Host: ") + host);
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(body.length()); // ✅ 用 body.length()
-    client.println("Connection: close");
-    client.println();
-    client.print(body);
+    Serial.println("❌ UDP: DNS failed");
+    return;
+  }
 
-    unsigned long t0 = millis();
-    while (client.connected() && millis() - t0 < 5000)
-    {
-      while (client.available())
-      {
-        String line = client.readStringUntil('\n');
-        Serial.println(line);
-        t0 = millis();
-      }
-    }
-    client.stop();
-    Serial.println("✅ POST /behaviours done");
-  }
-  else
+  // 3) 发送（使用全局 udpTx；setup 里已经 begin 过，如果没 begin 就容错一次）
+  static bool begun = false;
+  if (!begun)
   {
-    Serial.println("❌ Connection failed");
+    if (udp.begin(9000) == 0)
+    {
+      Serial.println("❌ UDP: begin failed");
+      return;
+    }
+    begun = true;
   }
+
+  if (!udp.beginPacket(dst, UDP_PORT))
+  {
+    Serial.println("❌ UDP: beginPacket failed");
+    return;
+  }
+  udp.write((const uint8_t *)body.c_str(), body.length());
+  if (!udp.endPacket())
+  {
+    Serial.println("❌ UDP: endPacket failed");
+    return;
+  }
+
+  Serial.println("✅ UDP sent");
 }
 
 /** ======= 工具函数 ======= */
-
 float sum(float *data, int n)
 {
   float s = 0;
@@ -779,47 +752,4 @@ float maxValue(float *data, int n)
     if (data[i] > m)
       m = data[i];
   return m;
-}
-
-float stddev(float *data, int n, float meanVal)
-{
-  float s = 0;
-  for (int i = 0; i < n; i++)
-  {
-    float diff = data[i] - meanVal;
-    s += diff * diff;
-  }
-  return sqrt(s / n);
-}
-
-float skewness(float *data, int n, float meanVal, float sdVal)
-{
-  float s = 0;
-  for (int i = 0; i < n; i++)
-  {
-    s += pow((data[i] - meanVal) / sdVal, 3);
-  }
-  return s / n;
-}
-
-float kurtosis(float *data, int n, float meanVal, float sdVal)
-{
-  float s = 0;
-  for (int i = 0; i < n; i++)
-  {
-    s += pow((data[i] - meanVal) / sdVal, 4);
-  }
-  return s / n - 3; // Fisher定义 (减3)
-}
-
-float correlation(float *a, float *b, int n, float meanA, float meanB)
-{
-  float num = 0, denA = 0, denB = 0;
-  for (int i = 0; i < n; i++)
-  {
-    num += (a[i] - meanA) * (b[i] - meanB);
-    denA += pow(a[i] - meanA, 2);
-    denB += pow(b[i] - meanB, 2);
-  }
-  return num / sqrt(denA * denB);
 }
